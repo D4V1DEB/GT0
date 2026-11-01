@@ -122,6 +122,7 @@
 <script>
 (function () {
   'use strict';
+  THREE.ColorManagement.legacyMode = false;
 
   // ─────────────────────────────────────────────── renderer / escena
   const canvas = document.getElementById('game');
@@ -129,6 +130,8 @@
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.outputEncoding = THREE.sRGBEncoding;
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
   const scene = new THREE.Scene();
   scene.fog = new THREE.Fog(0xe3d0ad, 300, 1500);
@@ -138,7 +141,18 @@
   scene.add(new THREE.HemisphereLight(0xd3e5f7, 0x8a6a42, 0.6));
   const sun = new THREE.DirectionalLight(0xfff3dd, 0.75);
   sun.position.set(320, 460, 180);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(1024, 1024);
+  sun.shadow.bias = -0.0009;
+  sun.shadow.camera.near = 1;
+  sun.shadow.camera.far = 260;
+  sun.shadow.camera.left = -16;
+  sun.shadow.camera.right = 16;
+  sun.shadow.camera.top = 16;
+  sun.shadow.camera.bottom = -16;
+  sun.shadow.camera.updateProjectionMatrix();
   scene.add(sun);
+  scene.add(sun.target);
 
   const maxAniso = renderer.capabilities.getMaxAnisotropy();
   const lambert = (color) => new THREE.MeshLambertMaterial({ color });
@@ -233,6 +247,23 @@
     return t;
   }
 
+  function kerbTexture() {
+    const c = document.createElement('canvas');
+    c.width = 32; c.height = 64;
+    const g = c.getContext('2d');
+    g.fillStyle = '#d4352c'; g.fillRect(0, 0, 32, 32);
+    g.fillStyle = '#e9e5da'; g.fillRect(0, 32, 32, 32);
+    for (let i = 0; i < 700; i++) {
+      g.fillStyle = 'rgba(42,38,34,' + (Math.random() * 0.3) + ')';
+      g.fillRect(Math.random() * 32, Math.random() * 64, 2, 2);
+    }
+    const t = new THREE.CanvasTexture(c);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.anisotropy = maxAniso;
+    t.encoding = THREE.sRGBEncoding;
+    return t;
+  }
+
   // ─────────────────────────────────────────────── trazado
   const ROAD_HW = 6.6;               // media anchura de pista (13,2 m)
   const SAMPLES = 720;
@@ -294,6 +325,7 @@
     buildRibbon(ROAD_HW, 0.05, 9),
     new THREE.MeshLambertMaterial({ map: asphaltTexture() })
   );
+  road.receiveShadow = true;
   scene.add(road);
 
   // arcén de tierra batida
@@ -301,26 +333,90 @@
     buildRibbon(ROAD_HW + 2.6, 0.0, 9),
     new THREE.MeshLambertMaterial({ color: 0x7d6a4a })
   );
+  shoulder.receiveShadow = true;
   scene.add(shoulder);
 
-  // ─────────────────────────────────────────────── suelo y paisaje
-  (function ground() {
-    const geo = new THREE.PlaneGeometry(4000, 4000, 1, 1);
-    geo.rotateX(-Math.PI / 2);
-    const mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ map: sandTexture() }));
-    mesh.position.y = -0.09;
+  // pianos rojiblancos en las curvas
+  (function kerbs() {
+    const n = samples.length;
+    const corner = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      corner[i] = samples[(i - 2 + n) % n].t.angleTo(samples[(i + 2) % n].t);
+    }
+    const W = 1.15, Y = 0.055;
+    const pos = [], uv = [], idx = [];
+    let quad = 0;
+    for (const side of [-1, 1]) {
+      for (let i = 0; i < n; i++) {
+        if (corner[i] < 0.09 && corner[(i + 1) % n] < 0.09) continue;
+        const a = samples[i], b = samples[(i + 1) % n];
+        const base = quad * 4;
+        for (let k = 0; k < 4; k++) {
+          const s = (k < 2) ? a : b;
+          const off = (k % 2 === 0) ? ROAD_HW : ROAD_HW + W;
+          pos.push(s.p.x + s.right.x * side * off, Y, s.p.z + s.right.z * side * off);
+          uv.push(k % 2 === 0 ? 0 : 1, s.dist / 2);
+        }
+        idx.push(base, base + 2, base + 1, base + 1, base + 2, base + 3);
+        quad++;
+      }
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+    geo.setIndex(idx);
+    geo.computeVertexNormals();
+    const mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({
+      map: kerbTexture(), side: THREE.DoubleSide
+    }));
+    mesh.receiveShadow = true;
     scene.add(mesh);
   })();
 
-  function distToTrack(x, z) {
+  // ─────────────────────────────────────────────── suelo y paisaje
+  function distToTrack(x, z, step) {
+    step = step || 2;
     let best = Infinity;
-    for (let i = 0; i < samples.length; i += 2) {
+    for (let i = 0; i < samples.length; i += step) {
       const dx = samples[i].p.x - x, dz = samples[i].p.z - z;
       const d = dx * dx + dz * dz;
       if (d < best) best = d;
     }
     return Math.sqrt(best);
   }
+
+  function hash2(x, z) {
+    const s = Math.sin(x * 127.1 + z * 311.7) * 43758.5453;
+    return s - Math.floor(s);
+  }
+
+  function noise2(x, z) {
+    const xi = Math.floor(x), zi = Math.floor(z);
+    const xf = x - xi, zf = z - zi;
+    const u = xf * xf * (3 - 2 * xf), v = zf * zf * (3 - 2 * zf);
+    const a = hash2(xi, zi), b = hash2(xi + 1, zi);
+    const c = hash2(xi, zi + 1), d = hash2(xi + 1, zi + 1);
+    return (a * (1 - u) + b * u) * (1 - v) + (c * (1 - u) + d * u) * v;
+  }
+
+  // llanura plana junto a la pista; dunas a partir de 110 m
+  (function ground() {
+    const geo = new THREE.PlaneGeometry(4000, 4000, 200, 200);
+    geo.rotateX(-Math.PI / 2);
+    const pos = geo.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i), z = pos.getZ(i);
+      const t = Math.min(Math.max((distToTrack(x, z, 6) - 110) / 220, 0), 1);
+      if (t <= 0) continue;
+      const s = t * t * (3 - 2 * t);
+      pos.setY(i, s * (noise2(x / 110, z / 110) * 12 + noise2(x / 300, z / 300) * 10));
+    }
+    geo.computeVertexNormals();
+    const mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ map: sandTexture() }));
+    mesh.position.y = -0.09;
+    mesh.receiveShadow = true;
+    scene.add(mesh);
+  })();
 
   (function mountains() {
     const group = new THREE.Group();
@@ -452,44 +548,74 @@
   // ─────────────────────────────────────────────── coche
   const carGroup = new THREE.Group();
   scene.add(carGroup);
+  const carBody = new THREE.Group();      // solo la carrocería: rueda al balancear
+  carGroup.add(carBody);
 
   const wheels = [];
+  let tailMat = null;
+
   (function buildCar() {
-    const base = new THREE.Color(0xb5251a);
+    const paint = lambert(0xb5251a);
+    const trim = lambert(0x1b2026);
+    const glass = lambert(0x131920);
+
+    // silueta lateral extruida a lo ancho, con bisel
+    const extrude = (pts, width, mat) => {
+      const shape = new THREE.Shape();
+      shape.moveTo(pts[0][0], pts[0][1]);
+      for (let i = 1; i < pts.length; i++) shape.lineTo(pts[i][0], pts[i][1]);
+      shape.closePath();
+      const geo = new THREE.ExtrudeGeometry(shape, {
+        depth: width, bevelEnabled: true, bevelSize: 0.05,
+        bevelThickness: 0.05, bevelSegments: 2, curveSegments: 1
+      });
+      geo.translate(0, 0, -width / 2);
+      geo.rotateY(-Math.PI / 2);
+      geo.computeVertexNormals();
+      return new THREE.Mesh(geo, mat);
+    };
+
+    carBody.add(extrude([
+      [2.02, 0.28], [2.16, 0.48], [2.04, 0.74], [0.78, 0.82],
+      [-0.90, 0.84], [-1.98, 0.80], [-2.16, 0.56], [-2.02, 0.28]
+    ], 1.72, paint));
+
+    carBody.add(extrude([
+      [0.86, 0.80], [0.24, 1.20], [-0.80, 1.24], [-1.74, 0.84]
+    ], 1.46, glass));
 
     const add = (geo, mat, x, y, z) => {
       const m = new THREE.Mesh(geo, mat);
       m.position.set(x, y, z);
-      carGroup.add(m);
+      carBody.add(m);
       return m;
     };
 
-    add(new THREE.BoxGeometry(1.9, 0.5, 4.3), lambert(base), 0, 0.62, 0);
-    add(new THREE.BoxGeometry(1.86, 0.28, 4.15), lambert(0x2a2c31), 0, 0.36, 0);
-    add(new THREE.BoxGeometry(1.62, 0.5, 2.0), lambert(0x1b2026), 0, 1.04, -0.25);
-    add(new THREE.BoxGeometry(1.5, 0.12, 1.55), lambert(base), 0, 1.31, -0.35);
-    add(new THREE.BoxGeometry(1.76, 0.09, 0.45), lambert(0x1b2026), 0, 1.24, -2.02);
-    add(new THREE.BoxGeometry(0.3, 0.02, 1.5), lambert(0x1b2026), 0, 0.875, 1.3);
-    [-0.66, 0.66].forEach(x => add(new THREE.BoxGeometry(0.1, 0.34, 0.12), lambert(0x1b2026), x, 1.06, -1.98));
+    add(new THREE.BoxGeometry(1.84, 0.10, 4.10), trim, 0, 0.26, 0);          // faldón
+    add(new THREE.BoxGeometry(1.80, 0.06, 0.30), trim, 0, 0.25, 2.00);       // splitter
+    add(new THREE.BoxGeometry(0.18, 0.02, 1.0), trim, 0, 0.835, 1.32);       // franja capó
+    add(new THREE.BoxGeometry(1.72, 0.07, 0.42), trim, 0, 0.98, -2.08);      // alerón
+    [-0.62, 0.62].forEach(x => add(new THREE.BoxGeometry(0.09, 0.26, 0.12), trim, x, 0.86, -2.05));
+    [-0.97, 0.97].forEach(x => add(new THREE.BoxGeometry(0.20, 0.07, 0.10), trim, x, 0.92, 0.52)); // espejos
 
-    const lightMat = new THREE.MeshBasicMaterial({ color: 0xfff6d8 });
-    const tailMat = new THREE.MeshBasicMaterial({ color: 0xff3b2f });
-    [-0.6, 0.6].forEach(x => {
-      add(new THREE.BoxGeometry(0.44, 0.16, 0.08), lightMat, x, 0.72, 2.16);
-      add(new THREE.BoxGeometry(0.42, 0.14, 0.08), tailMat, x, 0.72, -2.16);
+    const headMat = new THREE.MeshBasicMaterial({ color: 0xfff6d8 });
+    tailMat = new THREE.MeshBasicMaterial({ color: 0x5a120c });
+    [-0.58, 0.58].forEach(x => {
+      add(new THREE.BoxGeometry(0.46, 0.13, 0.07), headMat, x, 0.60, 2.14);
+      add(new THREE.BoxGeometry(0.46, 0.11, 0.07), tailMat, x, 0.64, -2.14);
     });
 
-    const tyreMat = lambert(0x181a1d);
-    const rimMat = new THREE.MeshLambertMaterial({ color: 0xb9bcc2 });
-    const tyreGeo = new THREE.CylinderGeometry(0.35, 0.35, 0.27, 16);
+    const tyreMat = lambert(0x141619);
+    const rimMat = new THREE.MeshLambertMaterial({ color: 0xb8bcc4 });
+    const tyreGeo = new THREE.CylinderGeometry(0.36, 0.36, 0.28, 20);
     tyreGeo.rotateZ(Math.PI / 2);
-    const rimGeo = new THREE.CylinderGeometry(0.19, 0.19, 0.29, 10);
+    const rimGeo = new THREE.CylinderGeometry(0.21, 0.21, 0.30, 12);
     rimGeo.rotateZ(Math.PI / 2);
 
-    [[-0.94, 1.36, true], [0.94, 1.36, true], [-0.94, -1.38, false], [0.94, -1.38, false]]
+    [[-0.92, 1.38, true], [0.92, 1.38, true], [-0.92, -1.40, false], [0.92, -1.40, false]]
       .forEach(([x, z, front]) => {
         const pivot = new THREE.Group();
-        pivot.position.set(x, 0.35, z);
+        pivot.position.set(x, 0.36, z);
         carGroup.add(pivot);
         const tyre = new THREE.Mesh(tyreGeo, tyreMat);
         const rim = new THREE.Mesh(rimGeo, rimMat);
@@ -497,14 +623,18 @@
         wheels.push({ pivot, tyre, rim, front });
       });
 
+    // oscurecido de contacto (la sombra real viene del sol)
     const shadow = new THREE.Mesh(
       new THREE.CircleGeometry(1, 24),
-      new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.22, depthWrite: false })
+      new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.12, depthWrite: false })
     );
     shadow.rotation.x = -Math.PI / 2;
-    shadow.scale.set(1.35, 2.35, 1);
+    shadow.scale.set(1.3, 2.25, 1);
     shadow.position.y = 0.11;
     carGroup.add(shadow);
+
+    carGroup.traverse(o => { if (o.isMesh) o.castShadow = true; });
+    shadow.castShadow = false;
   })();
 
   // ─────────────────────────────────────────────── estado
@@ -515,7 +645,8 @@
     pos: new THREE.Vector3(),
     yaw: 0,
     vel: new THREE.Vector3(),
-    hint: 0
+    hint: 0,
+    prevVF: 0
   };
 
   const START_IDX = SAMPLES - 3;
@@ -535,6 +666,7 @@
     car.yaw = Math.atan2(s.t.x, s.t.z);
     car.vel.set(0, 0, 0);
     car.hint = i;
+    car.prevVF = 0;
     prevIdx = i;
     hasRunUp = false;
     carGroup.position.copy(car.pos);
@@ -663,7 +795,8 @@
     const steerIn = (keys.KeyA ? 1 : 0) - (keys.KeyD ? 1 : 0);
     const speedRatio = Math.min(Math.abs(vF) / 55, 1);
     const steerRate = 1.55 * (1 - 0.55 * speedRatio) * Math.min(Math.abs(vF) / 5, 1);
-    car.yaw += steerIn * steerRate * Math.sign(vF || 1) * dt;
+    const yawRate = steerIn * steerRate * Math.sign(vF || 1);
+    car.yaw += yawRate * dt;
 
     car.pos.addScaledVector(car.vel, dt);
 
@@ -671,7 +804,18 @@
     carGroup.position.copy(car.pos);
     carGroup.rotation.y = car.yaw;
 
-    const spin = vF / 0.35 * dt;
+    // balanceo en curva y cabeceo al frenar/acelerar
+    const accel = dt > 0 ? (vF - car.prevVF) / dt : 0;
+    car.prevVF = vF;
+    const rollT = Math.max(-0.075, Math.min(0.075, -vF * yawRate * 0.0025));
+    const pitchT = Math.max(-0.05, Math.min(0.05, -accel * 0.0035));
+    const k = 1 - Math.exp(-9 * dt);
+    carBody.rotation.z += (rollT - carBody.rotation.z) * k;
+    carBody.rotation.x += (pitchT - carBody.rotation.x) * k;
+
+    tailMat.color.setHex((brake || hand) ? 0xff2a18 : 0x5a120c);
+
+    const spin = vF / 0.36 * dt;
     wheels.forEach(w => {
       w.tyre.rotation.x -= spin;
       w.rim.rotation.x -= spin;
@@ -765,6 +909,11 @@
     }
 
     updateCamera(dt);
+
+    // la sombra sigue al coche: frustum pequeño y nítido
+    sun.position.set(car.pos.x + 55, 85, car.pos.z + 38);
+    sun.target.position.copy(car.pos);
+    sun.target.updateMatrixWorld();
 
     if (flashTimer > 0) {
       flashTimer -= dt;

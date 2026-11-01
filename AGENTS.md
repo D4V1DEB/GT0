@@ -21,7 +21,7 @@ Hoy esto es un *vertical slice*, no el juego completo: una pista, un coche, vuel
   sin internet, sin bundler. Si algún día hace falta un módulo moderno, hay que servir por HTTP.
 - Un solo archivo: `index.html` (HTML + CSS + JS en línea).
 - Texturas y geometría 100 % procedurales (canvas / `BufferGeometry`), cero archivos de imagen.
-- Sin sombras dinámicas (sombra falsa bajo el coche) por rendimiento.
+- Sombras reales **solo** del sol, con frustum de 32 m que sigue al coche (mapa 1024).
 
 ## Estructura
 
@@ -39,12 +39,20 @@ Jugable de principio a fin: `Circuito Costa Verde` (~2,19 km, desierto costeño)
   el agarre lateral se amortigua (`exp(-grip*dt)`), menos con freno de mano o fuera de pista.
   Todo el *tuning* vive ahí: `maxF` 70 m/s (≈245 km/h), motor 13,5 m/s², freno 34 m/s²,
   `grip` 9,5 en pista / 3,2 fuera / 2,4 con freno de mano.
+- **Coche**: carrocería por extrusión de perfil lateral con bisel (`ExtrudeGeometry`, no cajas),
+  invernadero oscuro, faldón, splitter, alerón, espejos, franja de capó y luces. 4 ruedas con
+  llanta; giran y las delanteras giran con la dirección. La carrocería se balancea (roll con
+  `vF*yawRate`, pitch con la aceleración) y **solo ella**: las ruedas van en `carGroup`, la
+  carrocería en `carBody`. Luces de freno se encienden al frenar o con el freno de mano.
 - **Cámaras** con `C`: persecución (suavizada, FOV según velocidad) y primera persona a 1,5 m.
 - **Cronometraje** por índice de muestra sobre la curva (`checkLap`): la vuelta solo cuenta al
   cruzar meta hacia adelante *después* de pasar el 55 % del trazado. `R` recoloca en pista.
 - **HUD** HTML: vuelta, tiempo actual, mejor, última, velocímetro y aviso de fuera de pista.
-- Escenario: dunas/cerros truncados, rocas y cactus en `InstancedMesh`, pórtico con cartel,
-  tribuna, meta a cuadros.
+- Escenario: dunas y cerros por *heightfield* (planicie plana a menos de 110 m de la pista, para
+  que el coche nunca se entierre), rocas y cactus en `InstancedMesh`, pórtico con cartel,
+  tribuna, meta a cuadros y **pianos rojiblancos** en las curvas (curvatura > 0,09 rad).
+- **Color:** `THREE.ColorManagement.legacyMode = false` + `outputEncoding = sRGBEncoding`; sin
+  esto la paleta sale lavada (doble conversión lineal→sRGB).
 - **Rendimiento:** ~60 draw calls, sin post-proceso, `pixelRatio` máximo 2.
 
 ## Cómo probarlo
@@ -70,9 +78,23 @@ Doble clic en `index.html`. Controles: `W` acelerar, `S` frenar/reversa, `A`/`D`
 - Los UV de la carretera van en `dist/9`; la textura de asfalto se repite cada 9 m.
 - `renderer.outputEncoding = sRGBEncoding` con materiales `MeshLambert` (barato).
 - three.js es r149 a propósito: es la última con build UMD, y eso permite `file://`.
+- Los pianos se generan como quads sueltos: el *offset* se decide por vértice (`k % 2`), no por
+  muestra. Comparar `s === a` daba área cero y los pianos eran invisibles.
+- El *heightfield* usa `distToTrack(x, z, 6)` sobre 200×200 segmentos; subir el detalle lo hace
+  O(segmentos² × muestras) y congela la carga, así que se deja así.
+- El sol se recoloca cada frame a `car.pos + (55, 85, 38)` y su `target` es el coche: así el
+  frustum de 32 m siempre cubre el coche y la sombra no pierde resolución.
 
 ## Registro
 
+- **2026-11-01** — *Realismo de coche y mapa*. Carrocería rehecha: perfil lateral extruido con
+  bisel en vez de cajas, invernadero, faldón, splitter, alerón, espejos y franja de capó; carrocería
+  separada en `carBody` para poder balancear y cabecear sin mover las ruedas; luces de freno.
+  Sombra real (`PCFSoftShadowMap` 1024, frustum 32 m siguiendo al coche) más un manchón tenue de
+  contacto. Terreno con dunas/cerros procedurales (`noise2` + `distToTrack`) manteniendo plana la
+  franja de 110 m junto a la pista. Pianos rojiblancos en las curvas. Corregido de paso: la paleta
+  lavada (`ColorManagement.legacyMode = false`), `updateProjectionMatrix()` del shadow camera,
+  `car.prevVF` a 0 al recolocar, y el bug de los quads de piano con área cero.
 - **2026-11-01** — Nace el proyecto. Vertical slice del Circuito Costa Verde: trazado por spline
   cerrada (`CatmullRomCurve3`), cinta de asfalto con líneas de borde en la textura, física arcade,
   dos cámaras, cronometraje de vueltas, HUD, paisaje costeño y zona de meta.
